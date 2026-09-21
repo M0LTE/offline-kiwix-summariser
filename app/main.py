@@ -1,0 +1,275 @@
+"""HTTP surface.
+
+POST /v1/summarise returns 202 immediately with a job token and a status URL;
+GET /v1/jobs/{token} reports queued / processing / ready and carries the
+summary once ready. Nothing blocks on GPU time.
+"""
+import logging
+from contextlib import asynccontextmanager
+from typing import Annotated, Any
+
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from .config import Settings, get_settings
+from .jobs import Job, JobRunner, JobStatus, QueueFull
+from .kiwix import KiwixClient, KiwixError
+from .llm import OllamaClient
+from .summarise import Summariser
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+)
+log = logging.getLogger("app")
+
+POLL_AFTER_SECONDS = 2.0
+
+
+# --- request / response models ---------------------------------------------
+class SummariseRequest(BaseModel):
+    book: str = Field(..., min_length=1, max_length=256,
+                      description="Kiwix book key, e.g. wikipedia_en_all_maxi. See GET /v1/books.")
+    title: str = Field(..., min_length=1, max_length=512,
+                       description="Article title as a human would write it.")
+    words: int = Field(150, ge=10, le=4000, description="Target summary length in words.")
+    strict: bool = Field(
+        False,
+        description=(
+            "Refuse to summarise unless the title matches an article exactly. "
+            "Otherwise a fuzzy Kiwix search hit is used and reported in "
+            "result.resolved_via / result.article_title."
+        ),
+    )
+    section: str | int | None = Field(
+        None,
+        description=(
+            "Summarise one section instead of the whole article. Pick from "
+            "`result.sections` in a previous response: either its numeric id, "
+            "or a heading title matched case- and punctuation-insensitively."
+        ),
+    )
+    include_subsections: bool = Field(
+        True,
+        description=(
+            "With `section`, whether to include nested subsections. True means "
+            "'summarise the History section' the way a reader means it; False "
+            "restricts to that heading's own paragraphs."
+        ),
+    )
+
+
+class SummariseAccepted(BaseModel):
+    job_id: str
+    status: JobStatus
+    status_url: str
+    poll_after_seconds: float
+    queue_position: int | None = None
+
+
+class JobView(BaseModel):
+    job_id: str
+    status: JobStatus
+    request: dict[str, Any]
+    created_at: float
+    started_at: float | None = None
+    finished_at: float | None = None
+    processing_seconds: float | None = None
+    queue_position: int | None = None
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+
+
+# --- application wiring ----------------------------------------------------
+class State:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.kiwix = KiwixClient(settings.kiwix_base_url, settings.http_timeout_seconds)
+        self.llm = OllamaClient(
+            base_url=settings.ollama_base_url,
+            model=settings.ollama_model,
+            timeout=settings.llm_timeout_seconds,
+            keep_alive=settings.ollama_keep_alive,
+            temperature=settings.ollama_temperature,
+            think=settings.ollama_think,
+        )
+        self.summariser = Summariser(self.kiwix, self.llm, settings)
+        self.runner = JobRunner(
+            handler=self._handle,
+            workers=settings.llm_workers,
+            queue_max=settings.queue_max,
+            ttl_seconds=settings.job_ttl_seconds,
+        )
+
+    async def _handle(self, request: dict[str, Any]) -> dict[str, Any]:
+        result = await self.summariser.run(
+            book_key=request["book"],
+            title=request["title"],
+            words=request["words"],
+            strict=request.get("strict", False),
+            section=request.get("section"),
+            include_subsections=request.get("include_subsections", True),
+        )
+        return result.to_dict()
+
+
+state: State | None = None
+
+
+def get_state() -> State:
+    assert state is not None, "application is not initialised"
+    return state
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global state
+    settings = get_settings()
+    state = State(settings)
+    log.info(
+        "kiwix=%s ollama=%s model=%s num_ctx=%d workers=%d",
+        settings.kiwix_base_url, settings.ollama_base_url, settings.ollama_model,
+        settings.ollama_num_ctx, settings.llm_workers,
+    )
+    await state.runner.start()
+    try:
+        yield
+    finally:
+        await state.runner.stop()
+
+
+app = FastAPI(
+    title="Kiwix Summariser",
+    version="1.0.0",
+    description=(
+        "Request an N-word summary of any article in any publication served by a "
+        "local Kiwix instance, generated by a local LLM. Fully offline; jobs are "
+        "asynchronous and polled by token."
+    ),
+    lifespan=lifespan,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in get_settings().cors_origins.split(",") if o.strip()],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+StateDep = Annotated[State, Depends(get_state)]
+
+
+def _job_response(job: Job, runner: JobRunner) -> dict[str, Any]:
+    return job.view(position=runner.position(job))
+
+
+# --- routes ----------------------------------------------------------------
+@app.get("/")
+async def root(st: StateDep) -> dict[str, Any]:
+    s = st.settings
+    return {
+        "service": "kiwix-summariser",
+        "docs": "/docs",
+        "kiwix_base_url": s.kiwix_base_url,
+        "ollama_base_url": s.ollama_base_url,
+        "model": s.ollama_model,
+        "endpoints": [
+            "GET  /healthz",
+            "GET  /v1/books",
+            "GET  /v1/books/{key}/search?q=",
+            "POST /v1/summarise",
+            "GET  /v1/jobs/{job_id}",
+            "DELETE /v1/jobs/{job_id}",
+            "GET  /v1/stats",
+        ],
+    }
+
+
+@app.get("/healthz")
+async def healthz(st: StateDep) -> dict[str, Any]:
+    kiwix_ok, kiwix_detail = await st.kiwix.healthcheck()
+    ollama_ok, ollama_detail = await st.llm.healthcheck()
+    body = {
+        "status": "ok" if (kiwix_ok and ollama_ok) else "degraded",
+        "kiwix": {"ok": kiwix_ok, "detail": kiwix_detail},
+        "ollama": {"ok": ollama_ok, "detail": ollama_detail},
+        "jobs": st.runner.stats(),
+    }
+    return body
+
+
+@app.get("/v1/books")
+async def list_books(st: StateDep) -> dict[str, Any]:
+    """Every publication this Kiwix instance serves. Nothing is hardcoded."""
+    try:
+        books = await st.kiwix.books()
+    except KiwixError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    return {"count": len(books), "books": [b.to_dict() for b in books]}
+
+
+@app.get("/v1/books/{key}/search")
+async def search_book(key: str, q: str, st: StateDep, limit: int = 10) -> dict[str, Any]:
+    """Full-text search inside one book, for discovering exact titles."""
+    if not q.strip():
+        raise HTTPException(422, "q must not be empty")
+    try:
+        book = await st.kiwix.get_book(key)
+        results = await st.kiwix.search(book.key, q.strip(), limit=min(limit, 50))
+    except KiwixError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    return {
+        "book": book.key,
+        "query": q,
+        "count": len(results),
+        "results": [{"title": r.title, "url": r.url} for r in results],
+    }
+
+
+@app.post(
+    "/v1/summarise",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=SummariseAccepted,
+)
+async def summarise(payload: SummariseRequest, request: Request, st: StateDep) -> JSONResponse:
+    """Accept a summarisation request and return a poll URL immediately."""
+    try:
+        job = await st.runner.submit(payload.model_dump())
+    except QueueFull as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
+    body = SummariseAccepted(
+        job_id=job.id,
+        status=job.status,
+        status_url=f"/v1/jobs/{job.id}",
+        poll_after_seconds=POLL_AFTER_SECONDS,
+        queue_position=st.runner.position(job),
+    ).model_dump(mode="json")
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content=body,
+        headers={"Location": str(request.url_for("get_job", job_id=job.id))},
+    )
+
+
+@app.get("/v1/jobs/{job_id}", response_model=JobView)
+async def get_job(job_id: str, st: StateDep) -> dict[str, Any]:
+    job = st.runner.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "unknown or expired job id",
+        )
+    return _job_response(job, st.runner)
+
+
+@app.delete("/v1/jobs/{job_id}")
+async def cancel_job(job_id: str, st: StateDep) -> dict[str, Any]:
+    job = await st.runner.cancel(job_id)
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown job id")
+    return _job_response(job, st.runner)
+
+
+@app.get("/v1/stats")
+async def stats(st: StateDep) -> dict[str, Any]:
+    return st.runner.stats()
